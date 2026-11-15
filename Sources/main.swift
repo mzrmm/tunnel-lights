@@ -33,18 +33,33 @@ final class VPNMenuBarApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func refresh() {
         let (output, ok) = run("/usr/sbin/scutil", ["--nc", "list"])
-        if !ok { status = .unknown }
+        // Tunnelblick starts its own OpenVPN executable, which is not necessarily
+        // registered as a macOS VPN service visible to scutil.
+        let (processes, processCheckOK) = run("/bin/ps", ["-axo", "command="])
+        let tunnelblick = processCheckOK && processes.components(separatedBy: .newlines).contains { line in
+            let command = line.trimmingCharacters(in: .whitespaces)
+            return command.hasPrefix("/Applications/Tunnelblick.app/Contents/Resources/openvpn/") &&
+                   command.contains("/openvpn")
+        }
+        if !ok && !tunnelblick { status = .unknown }
         else {
-            let active = output.components(separatedBy: .newlines).filter {
+            let active = ok ? output.components(separatedBy: .newlines).filter {
                 $0.range(of: #"\(Connected\)"#, options: .regularExpression) != nil
-            }
+            } : []
             let joined = active.joined(separator: "\n").lowercased()
             let surf = joined.contains("com.surfshark.vpnclient.macos")
             let wg = joined.contains("com.wireguard.macos")
-            if surf && wg { status = .unknown }
+            let unknownService = active.contains { line in
+                let lower = line.lowercased()
+                return !lower.contains("com.surfshark.vpnclient.macos") &&
+                       !lower.contains("com.wireguard.macos")
+            }
+            let detectedConnections = [surf, wg, tunnelblick, unknownService]
+            let count = detectedConnections.filter { $0 }.count
+            if count > 1 || unknownService || !ok { status = .unknown }
+            else if tunnelblick { status = .tunnelblick }
             else if surf { status = .surfshark }
             else if wg { status = .wireguard }
-            else if !active.isEmpty { status = .unknown }
             else { status = .none }
         }
         updateDot()
@@ -97,22 +112,22 @@ final class VPNMenuBarApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 355),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 398),
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered, defer: false)
         window.title = "VPN Menu Bar – Einstellungen"
         window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 355))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 440, height: 398))
         window.contentView = content
 
-        let heading = label("Farben der Menüleistenanzeige", frame: NSRect(x: 24, y: 305, width: 370, height: 26), size: 17, bold: true)
+        let heading = label("Farben der Menüleistenanzeige", frame: NSRect(x: 24, y: 348, width: 370, height: 26), size: 17, bold: true)
         content.addSubview(heading)
-        let statuses: [VPNStatus] = [.wireguard, .surfshark, .none, .unknown]
+        let statuses: [VPNStatus] = [.wireguard, .surfshark, .tunnelblick, .none, .unknown]
         wells = []
         for (index, vpn) in statuses.enumerated() {
-            let y = 258 - CGFloat(index) * 43
+            let y = 301 - CGFloat(index) * 43
             content.addSubview(label(vpn.settingsName, frame: NSRect(x: 28, y: y, width: 260, height: 25), size: 14))
             let well = NSColorWell(frame: NSRect(x: 330, y: y - 2, width: 78, height: 30))
             well.color = color(for: vpn)
@@ -148,7 +163,7 @@ final class VPNMenuBarApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func colorChanged(_ sender: NSColorWell) {
-        let statuses: [VPNStatus] = [.wireguard, .surfshark, .none, .unknown]
+        let statuses: [VPNStatus] = [.wireguard, .surfshark, .tunnelblick, .none, .unknown]
         guard statuses.indices.contains(sender.tag) else { return }
         if let data = try? NSKeyedArchiver.archivedData(withRootObject: sender.color, requiringSecureCoding: true) {
             defaults.set(data, forKey: statuses[sender.tag].key)
@@ -157,7 +172,7 @@ final class VPNMenuBarApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func resetColors() {
-        let statuses: [VPNStatus] = [.wireguard, .surfshark, .none, .unknown]
+        let statuses: [VPNStatus] = [.wireguard, .surfshark, .tunnelblick, .none, .unknown]
         for (index, vpn) in statuses.enumerated() {
             defaults.removeObject(forKey: vpn.key)
             wells[index].color = vpn.defaultColor
@@ -193,11 +208,12 @@ final class VPNMenuBarApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
 }
 
 enum VPNStatus {
-    case wireguard, surfshark, none, unknown
+    case wireguard, surfshark, tunnelblick, none, unknown
     var key: String {
         switch self {
         case .wireguard: return "color.wireguard"
         case .surfshark: return "color.surfshark"
+        case .tunnelblick: return "color.tunnelblick"
         case .none: return "color.none"
         case .unknown: return "color.unknown"
         }
@@ -206,6 +222,7 @@ enum VPNStatus {
         switch self {
         case .wireguard: return "WireGuard aktiv"
         case .surfshark: return "Surfshark aktiv"
+        case .tunnelblick: return "Tunnelblick (OpenVPN) aktiv"
         case .none: return "Kein VPN verbunden (laut scutil)"
         case .unknown: return "VPN-Status unklar"
         }
@@ -214,6 +231,7 @@ enum VPNStatus {
         switch self {
         case .wireguard: return "WireGuard"
         case .surfshark: return "Surfshark"
+        case .tunnelblick: return "Tunnelblick (OpenVPN)"
         case .none: return "Kein VPN"
         case .unknown: return "Unbekannt / mehrere VPNs"
         }
@@ -222,6 +240,7 @@ enum VPNStatus {
         switch self {
         case .wireguard: return NSColor(calibratedRed: 0.86, green: 0.12, blue: 0.12, alpha: 1)
         case .surfshark: return NSColor(calibratedRed: 0.08, green: 0.48, blue: 0.91, alpha: 1)
+        case .tunnelblick: return NSColor(calibratedRed: 0.57, green: 0.31, blue: 0.85, alpha: 1)
         case .none: return NSColor(calibratedRed: 0.08, green: 0.65, blue: 0.29, alpha: 1)
         case .unknown: return NSColor(calibratedRed: 0.95, green: 0.58, blue: 0.08, alpha: 1)
         }
